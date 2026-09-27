@@ -1,0 +1,101 @@
+name: 1 - Sync cloudflared source
+
+# Copies the cloudflare/cloudflared source into ./cloudflared and pushes it to main.
+# Run this whenever you want to move to a newer cloudflared release, then run
+# "2 - Build and push image to ACR" to publish it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "cloudflared tag, branch or commit SHA to sync (e.g. 2026.9.3 or master). Leave empty for the latest release."
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-cloudflared
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: cloudflare/cloudflared
+  SOURCE_DIR: cloudflared
+  METADATA_FILE: cloudflared-source.json
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: Resolve cloudflared ref
+        id: ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          ref="$INPUT_REF"
+          if [ -z "$ref" ]; then
+            ref=$(gh release view --repo "$UPSTREAM_REPO" --json tagName --jq .tagName)
+            echo "No ref given, using the latest release: $ref"
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Check out cloudflared
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ steps.ref.outputs.ref }}
+          path: _upstream
+          # Full history (without file contents) so `git describe` can find the release tag.
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Copy source into ${{ env.SOURCE_DIR }}/
+        id: sync
+        env:
+          REF: ${{ steps.ref.outputs.ref }}
+        run: |
+          commit=$(git -C _upstream rev-parse HEAD)
+          # Same version string cloudflared's Makefile would produce from a git checkout.
+          version=$(git -C _upstream describe --tags --always --match "[0-9][0-9][0-9][0-9].*.*")
+
+          rsync -a --delete --exclude='/.git' --exclude='/.github' _upstream/ "$SOURCE_DIR/"
+
+          jq -n \
+            --arg repository "https://github.com/$UPSTREAM_REPO" \
+            --arg ref "$REF" \
+            --arg commit "$commit" \
+            --arg version "$version" \
+            '{repository: $repository, ref: $ref, commit: $commit, version: $version}' > "$METADATA_FILE"
+
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push to main
+        env:
+          REF: ${{ steps.ref.outputs.ref }}
+          COMMIT: ${{ steps.sync.outputs.commit }}
+          VERSION: ${{ steps.sync.outputs.version }}
+        run: |
+          # --force: mirror every upstream file, even ones matched by upstream's own .gitignore.
+          git add --all --force -- "$SOURCE_DIR" "$METADATA_FILE"
+
+          if git diff --cached --quiet; then
+            echo "Already in sync with $UPSTREAM_REPO@$REF ($VERSION), nothing to commit." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --quiet -m "Sync cloudflared $VERSION" -m "Source: https://github.com/$UPSTREAM_REPO/tree/$COMMIT (ref: $REF)"
+          git push origin HEAD:main
+
+          echo "Synced cloudflared **$VERSION** ($REF @ \`${COMMIT:0:12}\`) into \`$SOURCE_DIR/\` and pushed to main." >> "$GITHUB_STEP_SUMMARY"
